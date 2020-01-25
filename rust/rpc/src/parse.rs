@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All rights reserved.
+// Copyright 2017 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,11 @@
 
 use std::io::BufRead;
 
-use serde_json::{self, Value, Error as JsonError};
 use serde::de::DeserializeOwned;
+use serde_json::{self, Error as JsonError, Value};
+use xi_trace;
 
-use error::{RemoteError, ReadError};
-
+use crate::error::{ReadError, RemoteError};
 
 /// A unique identifier attached to request RPCs.
 type RequestId = u64;
@@ -40,7 +40,7 @@ pub struct MessageReader(String);
 /// occur on the read thread. If the message looks like a request, it
 /// is passed to the main thread for handling.
 #[derive(Debug, Clone)]
-pub struct RpcObject(Value);
+pub struct RpcObject(pub Value);
 
 #[derive(Debug, Clone, PartialEq)]
 /// An RPC call, which may be either a notification or a request.
@@ -63,8 +63,7 @@ impl MessageReader {
     /// This function will return an error if there is an underlying
     /// I/O error, if the stream is closed, or if the message is not
     /// a valid JSON object.
-    pub fn next<R: BufRead>(&mut self, reader: &mut R)
-                        -> Result<RpcObject, ReadError> {
+    pub fn next<R: BufRead>(&mut self, reader: &mut R) -> Result<RpcObject, ReadError> {
         self.0.clear();
         let _ = reader.read_line(&mut self.0)?;
         if self.0.is_empty() {
@@ -79,6 +78,7 @@ impl MessageReader {
     /// This should not be called directly unless you are writing tests.
     #[doc(hidden)]
     pub fn parse(&self, s: &str) -> Result<RpcObject, ReadError> {
+        let _trace = xi_trace::trace_block("parse", &["rpc"]);
         let val = serde_json::from_str::<Value>(&s)?;
         if !val.is_object() {
             Err(ReadError::NotObject)
@@ -95,7 +95,7 @@ impl RpcObject {
     }
 
     /// Returns the 'method' field of the underlying object, if present.
-    pub fn get_method<'a>(&'a self) -> Option<&'a str> {
+    pub fn get_method(&self) -> Option<&str> {
         self.0.get("method").and_then(Value::as_str)
     }
 
@@ -118,21 +118,19 @@ impl RpcObject {
     /// return a `String` containing an error message. The caller should
     /// print this message and exit.
     pub fn into_response(mut self) -> Result<Response, String> {
-        let _ = self.get_id()
-            .ok_or("Response requires 'id' field.".to_string())?;
+        let _ = self.get_id().ok_or("Response requires 'id' field.".to_string())?;
 
         if self.0.get("result").is_some() == self.0.get("error").is_some() {
             return Err("RPC response must contain exactly one of\
-                       'error' or 'result' fields.".into());
+                        'error' or 'result' fields."
+                .into());
         }
-        let result = self.0.as_object_mut()
-            .and_then(|obj| obj.remove("result"));
-        //let id = id.map(Value::from).unwrap_or(Value::Null);
+        let result = self.0.as_object_mut().and_then(|obj| obj.remove("result"));
+
         match result {
             Some(r) => Ok(Ok(r)),
             None => {
-                let error = self.0.as_object_mut()
-                    .and_then(|obj| obj.remove("error")).unwrap();
+                let error = self.0.as_object_mut().and_then(|obj| obj.remove("error")).unwrap();
                 match serde_json::from_value::<RemoteError>(error) {
                     Ok(e) => Ok(Err(e)),
                     Err(e) => Err(format!("Error handling response: {:?}", e)),
@@ -149,17 +147,16 @@ impl RpcObject {
     /// Returns a `serde_json::Error` if the `Value` cannot be converted
     /// to one of the expected types.
     pub fn into_rpc<N, R>(self) -> Result<Call<N, R>, JsonError>
-    where N: DeserializeOwned,
-          R: DeserializeOwned,
+    where
+        N: DeserializeOwned,
+        R: DeserializeOwned,
     {
         let id = self.get_id();
         match id {
-            Some(id) => {
-                match serde_json::from_value::<R>(self.0) {
-                    Ok(resp) => Ok(Call::Request(id, resp)),
-                    Err(err) => Ok(Call::InvalidRequest(id, err.into())),
-                }
-            }
+            Some(id) => match serde_json::from_value::<R>(self.0) {
+                Ok(resp) => Ok(Call::Request(id, resp)),
+                Err(err) => Ok(Call::InvalidRequest(id, err.into())),
+            },
             None => {
                 let result = serde_json::from_value::<N>(self.0)?;
                 Ok(Call::Notification(result))
@@ -174,12 +171,11 @@ impl From<Value> for RpcObject {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
 
-    use serde_json;
     use super::*;
+    use serde_json;
 
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     #[serde(rename_all = "snake_case")]
@@ -241,7 +237,7 @@ mod tests {
         let json = r#"{"id":5,"error":{"code":420, "message":"chill out"}}"#;
         let p: RpcObject = serde_json::from_str::<Value>(json).unwrap().into();
         assert!(p.is_response());
-        let resp  = p.into_response().unwrap();
+        let resp = p.into_response().unwrap();
         assert_eq!(resp, Err(RemoteError::custom(420, "chill out", None)));
     }
 
@@ -250,7 +246,7 @@ mod tests {
         let json = r#"{"id":5,"result":"success!"}"#;
         let p: RpcObject = serde_json::from_str::<Value>(json).unwrap().into();
         assert!(p.is_response());
-        let resp  = p.into_response().unwrap();
+        let resp = p.into_response().unwrap();
         assert_eq!(resp, Ok(json!("success!")));
     }
 

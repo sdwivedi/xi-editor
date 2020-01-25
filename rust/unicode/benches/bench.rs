@@ -1,4 +1,4 @@
-// Copyright 2016 Google Inc. All rights reserved.
+// Copyright 2016 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #![feature(test)]
 
 extern crate test;
@@ -21,7 +20,7 @@ extern crate xi_unicode;
 #[cfg(test)]
 mod bench {
     use std::cmp::max;
-    use test::{Bencher, black_box};
+    use test::{black_box, Bencher};
     use xi_unicode::linebreak_property;
     use xi_unicode::linebreak_property_str;
     use xi_unicode::LineBreakIterator;

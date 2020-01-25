@@ -1,4 +1,4 @@
-// Copyright 2016 Google Inc. All rights reserved.
+// Copyright 2016 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,33 +21,43 @@
 //!
 //! Because these changes make the protocol not fully compliant with the spec,
 //! the `"jsonrpc"` member is omitted from request and response objects.
+#![allow(clippy::boxed_local, clippy::or_fun_call)]
 
 #[macro_use]
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
+extern crate crossbeam_utils;
 extern crate serde;
-extern crate crossbeam;
+extern crate xi_trace;
 
 #[macro_use]
-mod macros;
-mod parse;
+extern crate log;
+
 mod error;
+mod parse;
 
 pub mod test_utils;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::io::{self, BufRead, Write};
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-use parse::{Call, Response, RpcObject, MessageReader};
-pub use error::{Error, ReadError, RemoteError};
+use xi_trace::{trace, trace_block, trace_block_payload, trace_payload};
 
+pub use crate::error::{Error, ReadError, RemoteError};
+use crate::parse::{Call, MessageReader, Response, RpcObject};
+
+/// The maximum duration we will block on a reader before checking for an task.
+const MAX_IDLE_WAIT: Duration = Duration::from_millis(5);
 
 /// An interface to access the other side of the RPC channel. The main purpose
 /// is to send RPC requests and notifications to the peer.
@@ -63,33 +73,42 @@ pub struct RawPeer<W: Write + 'static>(Arc<RpcState<W>>);
 /// channel. It is intended to be used behind a pointer, a trait object.
 pub trait Peer: Send + 'static {
     /// Used to implement `clone` in an object-safe way.
-    /// For an explanation on this approach, see this thread:
-    /// https://users.rust-lang.org/t/solved-is-it-possible-to-clone-a-boxed-trait-object/1714/6
-    fn box_clone(&self) -> Box<Peer>;
+    /// For an explanation on this approach, see
+    /// [this thread](https://users.rust-lang.org/t/solved-is-it-possible-to-clone-a-boxed-trait-object/1714/6).
+    fn box_clone(&self) -> Box<dyn Peer>;
     /// Sends a notification (asynchronous RPC) to the peer.
     fn send_rpc_notification(&self, method: &str, params: &Value);
     /// Sends a request asynchronously, and the supplied callback will
     /// be called when the response arrives.
     ///
-    /// `Callback` is an alias for FnOnce(Result<Value, Error>); it must
+    /// `Callback` is an alias for `FnOnce(Result<Value, Error>)`; it must
     /// be boxed because trait objects cannot use generic paramaters.
-    fn send_rpc_request_async(&self, method: &str, params: &Value,
-                              f: Box<Callback>);
+    fn send_rpc_request_async(&self, method: &str, params: &Value, f: Box<dyn Callback>);
     /// Sends a request (synchronous RPC) to the peer, and waits for the result.
-    fn send_rpc_request(&self, method: &str, params: &Value)
-                        -> Result<Value, Error>;
+    fn send_rpc_request(&self, method: &str, params: &Value) -> Result<Value, Error>;
     /// Determines whether an incoming request (or notification) is
     /// pending. This is intended to reduce latency for bulk operations
     /// done in the background.
     fn request_is_pending(&self) -> bool;
+    /// Adds a token to the idle queue. When the runloop is idle and the
+    /// queue is not empty, the handler's `idle` fn will be called
+    /// with the earliest added token.
+    fn schedule_idle(&self, token: usize);
+    /// Like `schedule_idle`, with the guarantee that the handler's `idle`
+    /// fn will not be called _before_ the provided `Instant`.
+    ///
+    /// # Note
+    ///
+    /// This is not intended as a high-fidelity timer. Regular RPC messages
+    /// will always take priority over an idle task.
+    fn schedule_timer(&self, after: Instant, token: usize);
 }
 
 /// The `Peer` trait object.
-pub type RpcPeer = Box<Peer>;
+pub type RpcPeer = Box<dyn Peer>;
 
-pub struct RpcCtx<'a> {
+pub struct RpcCtx {
     peer: RpcPeer,
-    idle: &'a mut VecDeque<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,11 +129,10 @@ pub struct RpcCall {
 pub trait Handler {
     type Notification: DeserializeOwned;
     type Request: DeserializeOwned;
-    fn handle_notification(&mut self, ctx: RpcCtx, rpc: Self::Notification);
-    fn handle_request(&mut self, ctx: RpcCtx, rpc: Self::Request)
-                      -> Result<Value, RemoteError>;
+    fn handle_notification(&mut self, ctx: &RpcCtx, rpc: Self::Notification);
+    fn handle_request(&mut self, ctx: &RpcCtx, rpc: Self::Request) -> Result<Value, RemoteError>;
     #[allow(unused_variables)]
-    fn idle(&mut self, ctx: RpcCtx, token: usize) {}
+    fn idle(&mut self, ctx: &RpcCtx, token: usize) {}
 }
 
 pub trait Callback: Send {
@@ -127,11 +145,24 @@ impl<F: Send + FnOnce(Result<Value, Error>)> Callback for F {
     }
 }
 
+/// A helper type which shuts down the runloop if a panic occurs while
+/// handling an RPC.
+struct PanicGuard<'a, W: Write + 'static>(&'a RawPeer<W>);
+
+impl<'a, W: Write + 'static> Drop for PanicGuard<'a, W> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            error!("panic guard hit, closing runloop");
+            self.0.disconnect();
+        }
+    }
+}
+
 trait IdleProc: Send {
     fn call(self: Box<Self>, token: usize);
 }
 
-impl<F:Send + FnOnce(usize)> IdleProc for F {
+impl<F: Send + FnOnce(usize)> IdleProc for F {
     fn call(self: Box<F>, token: usize) {
         (*self)(token)
     }
@@ -139,7 +170,7 @@ impl<F:Send + FnOnce(usize)> IdleProc for F {
 
 enum ResponseHandler {
     Chan(mpsc::Sender<Result<Value, Error>>),
-    Callback(Box<Callback>),
+    Callback(Box<dyn Callback>),
 }
 
 impl ResponseHandler {
@@ -147,10 +178,16 @@ impl ResponseHandler {
         match self {
             ResponseHandler::Chan(tx) => {
                 let _ = tx.send(result);
-            },
-            ResponseHandler::Callback(f) => f.call(result)
+            }
+            ResponseHandler::Callback(f) => f.call(result),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Timer {
+    fire_after: Instant,
+    token: usize,
 }
 
 struct RpcState<W: Write> {
@@ -159,6 +196,10 @@ struct RpcState<W: Write> {
     writer: Mutex<W>,
     id: AtomicUsize,
     pending: Mutex<BTreeMap<usize, ResponseHandler>>,
+    idle_queue: Mutex<VecDeque<usize>>,
+    timers: Mutex<BinaryHeap<Timer>>,
+    needs_exit: AtomicBool,
+    is_blocked: AtomicBool,
 }
 
 /// A structure holding the state of a main loop for handling RPC's.
@@ -177,11 +218,12 @@ impl<W: Write + Send> RpcLoop<W> {
             writer: Mutex::new(writer),
             id: AtomicUsize::new(0),
             pending: Mutex::new(BTreeMap::new()),
+            idle_queue: Mutex::new(VecDeque::new()),
+            timers: Mutex::new(BinaryHeap::new()),
+            needs_exit: AtomicBool::new(false),
+            is_blocked: AtomicBool::new(false),
         }));
-        RpcLoop {
-            reader: MessageReader::default(),
-            peer: rpc_peer,
-        }
+        RpcLoop { reader: MessageReader::default(), peer: rpc_peer }
     }
 
     /// Gets a reference to the peer.
@@ -192,7 +234,7 @@ impl<W: Write + Send> RpcLoop<W> {
     /// Starts the event loop, reading lines from the reader until EOF,
     /// or an error occurs.
     ///
-    /// Returns `Ok()` in  the EOF case, otherwise returns the
+    /// Returns `Ok()` in the EOF case, otherwise returns the
     /// underlying `ReadError`.
     ///
     /// # Note:
@@ -206,36 +248,50 @@ impl<W: Write + Send> RpcLoop<W> {
     /// Calls to the handler are guaranteed to preserve the order as
     /// they appear on on the channel. At the moment, there is no way
     /// for there to be more than one incoming request to be outstanding.
-    pub fn mainloop<'a, R, RF, H>(&mut self, rf: RF, handler: &mut H)
-                                  -> Result<(), ReadError>
-    where R: BufRead,
-          RF: Send + FnOnce() -> R,
-          H: Handler,
+    pub fn mainloop<R, RF, H>(&mut self, rf: RF, handler: &mut H) -> Result<(), ReadError>
+    where
+        R: BufRead,
+        RF: Send + FnOnce() -> R,
+        H: Handler,
     {
-
-        let exit = crossbeam::scope(|scope| {
+        let exit = crossbeam_utils::thread::scope(|scope| {
             let peer = self.get_raw_peer();
-            scope.spawn(move|| {
+            peer.reset_needs_exit();
+
+            let ctx = RpcCtx { peer: Box::new(peer.clone()) };
+            scope.spawn(move |_| {
                 let mut stream = rf();
                 loop {
+                    // The main thread cannot return while this thread is active;
+                    // when the main thread wants to exit it sets this flag.
+                    if self.peer.needs_exit() {
+                        trace("read loop exit", &["rpc"]);
+                        break;
+                    }
+
                     let json = match self.reader.next(&mut stream) {
                         Ok(json) => json,
                         Err(err) => {
+                            if self.peer.0.is_blocked.load(Ordering::Acquire) {
+                                error!("failed to parse response json: {}", err);
+                                self.peer.disconnect();
+                            }
                             self.peer.put_rx(Err(err));
-                            break
+                            break;
                         }
                     };
                     if json.is_response() {
                         let id = json.get_id().unwrap();
+                        let _resp =
+                            trace_block_payload("read loop response", &["rpc"], format!("{}", id));
                         match json.into_response() {
                             Ok(resp) => {
                                 let resp = resp.map_err(Error::from);
                                 self.peer.handle_response(id, resp);
                             }
                             Err(msg) => {
-                                print_err!("failed to parse response: {}", msg);
-                                self.peer.handle_response(
-                                    id, Err(Error::InvalidResponse));
+                                error!("failed to parse response: {}", msg);
+                                self.peer.handle_response(id, Err(Error::InvalidResponse));
                             }
                         }
                     } else {
@@ -244,53 +300,47 @@ impl<W: Write + Send> RpcLoop<W> {
                 }
             });
 
-            let mut idle = VecDeque::<usize>::new();
             loop {
-                // pending messages take priority over idle work
-                let json = if !idle.is_empty() {
-                    if let Some(json) = peer.try_get_rx() {
-                        json
-                    } else {
-                        let token = idle.pop_front().unwrap();
-                        let ctx = RpcCtx {
-                            peer: Box::new(peer.clone()),
-                            idle: &mut idle,
-                        };
-                        handler.idle(ctx, token);
-                        continue;
-                    }
-                } else {
-                    peer.get_rx()
-                };
+                let _guard = PanicGuard(&peer);
+                let read_result = next_read(&peer, handler, &ctx);
+                let _trace = trace_block("main got msg", &["rpc"]);
 
-                let json = match json {
+                let json = match read_result {
                     Ok(json) => json,
                     Err(err) => {
+                        trace_payload("main loop err", &["rpc"], err.to_string());
+                        // finish idle work before disconnecting;
+                        // this is mostly useful for integration tests.
+                        if let Some(idle_token) = peer.try_get_idle() {
+                            handler.idle(&ctx, idle_token);
+                        }
                         peer.disconnect();
-                        return err
+                        return err;
                     }
                 };
 
-                let ctx = RpcCtx {
-                    peer: Box::new(peer.clone()),
-                    idle: &mut idle,
-                };
-
-                let parsed = json.into_rpc::<H::Notification, H::Request>();
-                match parsed {
+                let method = json.get_method().map(String::from);
+                match json.into_rpc::<H::Notification, H::Request>() {
                     Ok(Call::Request(id, cmd)) => {
-                        let result = handler.handle_request(ctx, cmd);
+                        let _t = trace_block_payload("handle request", &["rpc"], method.unwrap());
+                        let result = handler.handle_request(&ctx, cmd);
                         peer.respond(result, id);
                     }
-                    Ok(Call::Notification(cmd)) => handler.handle_notification(ctx, cmd),
+                    Ok(Call::Notification(cmd)) => {
+                        let _t = trace_block_payload("handle notif", &["rpc"], method.unwrap());
+                        handler.handle_notification(&ctx, cmd);
+                    }
                     Ok(Call::InvalidRequest(id, err)) => peer.respond(Err(err), id),
                     Err(err) => {
+                        trace_payload("read loop exit", &["rpc"], err.to_string());
                         peer.disconnect();
-                        return ReadError::UnknownRequest(err)
+                        return ReadError::UnknownRequest(err);
                     }
                 }
             }
-        });
+        })
+        .unwrap();
+
         if exit.is_disconnect() {
             Ok(())
         } else {
@@ -299,41 +349,81 @@ impl<W: Write + Send> RpcLoop<W> {
     }
 }
 
-impl<'a> RpcCtx<'a> {
+/// Returns the next read result, checking for idle work when no
+/// result is available.
+fn next_read<W, H>(peer: &RawPeer<W>, handler: &mut H, ctx: &RpcCtx) -> Result<RpcObject, ReadError>
+where
+    W: Write + Send,
+    H: Handler,
+{
+    loop {
+        if let Some(result) = peer.try_get_rx() {
+            return result;
+        }
+        // handle timers before general idle work
+        let time_to_next_timer = match peer.check_timers() {
+            Some(Ok(token)) => {
+                do_idle(handler, ctx, token);
+                continue;
+            }
+            Some(Err(duration)) => Some(duration),
+            None => None,
+        };
+
+        if let Some(idle_token) = peer.try_get_idle() {
+            do_idle(handler, ctx, idle_token);
+            continue;
+        }
+
+        // we don't want to block indefinitely if there's no current idle work,
+        // because idle work could be scheduled from another thread.
+        let idle_timeout = time_to_next_timer.unwrap_or(MAX_IDLE_WAIT).min(MAX_IDLE_WAIT);
+
+        if let Some(result) = peer.get_rx_timeout(idle_timeout) {
+            return result;
+        }
+    }
+}
+
+fn do_idle<H: Handler>(handler: &mut H, ctx: &RpcCtx, token: usize) {
+    let _trace = trace_block_payload("do_idle", &["rpc"], format!("token: {}", token));
+    handler.idle(ctx, token);
+}
+
+impl RpcCtx {
     pub fn get_peer(&self) -> &RpcPeer {
         &self.peer
     }
 
     /// Schedule the idle handler to be run when there are no requests pending.
-    pub fn schedule_idle(&mut self, token: usize) {
-        self.idle.push_back(token);
+    pub fn schedule_idle(&self, token: usize) {
+        self.peer.schedule_idle(token)
     }
 }
 
 impl<W: Write + Send + 'static> Peer for RawPeer<W> {
-
-    fn box_clone(&self) -> Box<Peer> {
+    fn box_clone(&self) -> Box<dyn Peer> {
         Box::new((*self).clone())
     }
 
     fn send_rpc_notification(&self, method: &str, params: &Value) {
+        let _trace = trace_block_payload("send notif", &["rpc"], method.to_owned());
         if let Err(e) = self.send(&json!({
             "method": method,
             "params": params,
         })) {
-            print_err!("send error on send_rpc_notification method {}: {}",
-                       method, e);
+            error!("send error on send_rpc_notification method {}: {}", method, e);
         }
     }
 
-    fn send_rpc_request_async(&self, method: &str, params: &Value,
-                              f: Box<Callback>) {
-        self.send_rpc_request_common(method, params,
-                                     ResponseHandler::Callback(f));
+    fn send_rpc_request_async(&self, method: &str, params: &Value, f: Box<dyn Callback>) {
+        let _trace = trace_block_payload("send req async", &["rpc"], method.to_owned());
+        self.send_rpc_request_common(method, params, ResponseHandler::Callback(f));
     }
 
-    fn send_rpc_request(&self, method: &str, params: &Value)
-                        -> Result<Value, Error> {
+    fn send_rpc_request(&self, method: &str, params: &Value) -> Result<Value, Error> {
+        let _trace = trace_block_payload("send req sync", &["rpc"], method.to_owned());
+        self.0.is_blocked.store(true, Ordering::Release);
         let (tx, rx) = mpsc::channel();
         self.send_rpc_request_common(method, params, ResponseHandler::Chan(tx));
         rx.recv().unwrap_or(Err(Error::PeerDisconnect))
@@ -343,10 +433,19 @@ impl<W: Write + Send + 'static> Peer for RawPeer<W> {
         let queue = self.0.rx_queue.lock().unwrap();
         !queue.is_empty()
     }
+
+    fn schedule_idle(&self, token: usize) {
+        self.0.idle_queue.lock().unwrap().push_back(token);
+    }
+
+    fn schedule_timer(&self, after: Instant, token: usize) {
+        self.0.timers.lock().unwrap().push(Timer { fire_after: after, token });
+    }
 }
 
-impl<W:Write> RawPeer<W> {
+impl<W: Write> RawPeer<W> {
     fn send(&self, v: &Value) -> Result<(), io::Error> {
+        let _trace = trace_block("send", &["rpc"]);
         let mut s = serde_json::to_string(v).unwrap();
         s.push('\n');
         self.0.writer.lock().unwrap().write_all(s.as_bytes())
@@ -354,18 +453,17 @@ impl<W:Write> RawPeer<W> {
     }
 
     fn respond(&self, result: Response, id: u64) {
-        let mut response = json!({"id": id});
+        let mut response = json!({ "id": id });
         match result {
             Ok(result) => response["result"] = result,
             Err(error) => response["error"] = json!(error),
         };
         if let Err(e) = self.send(&response) {
-            print_err!("error {} sending response to RPC {:?}", e, id);
+            error!("error {} sending response to RPC {:?}", e, id);
         }
     }
 
-    fn send_rpc_request_common(&self, method: &str,
-                               params: &Value, rh: ResponseHandler) {
+    fn send_rpc_request_common(&self, method: &str, params: &Value, rh: ResponseHandler) {
         let id = self.0.id.fetch_add(1, Ordering::Relaxed);
         {
             let mut pending = self.0.pending.lock().unwrap();
@@ -391,7 +489,7 @@ impl<W:Write> RawPeer<W> {
         };
         match handler {
             Some(responsehandler) => responsehandler.invoke(resp),
-            None => print_err!("id {} not found in pending", id)
+            None => warn!("id {} not found in pending", id),
         }
     }
 
@@ -401,13 +499,13 @@ impl<W:Write> RawPeer<W> {
         queue.pop_front()
     }
 
-    /// Get a message from the receive queue, blocking until available.
-    fn get_rx(&self) -> Result<RpcObject, ReadError> {
+    /// Get a message from the receive queue, waiting for at most `Duration`
+    /// and returning `None` if no message is available.
+    fn get_rx_timeout(&self, dur: Duration) -> Option<Result<RpcObject, ReadError>> {
         let mut queue = self.0.rx_queue.lock().unwrap();
-        while queue.is_empty() {
-            queue = self.0.rx_cvar.wait(queue).unwrap();
-        }
-        queue.pop_front().unwrap()
+        let result = self.0.rx_cvar.wait_timeout(queue, dur).unwrap();
+        queue = result.0;
+        queue.pop_front()
     }
 
     /// Adds a message to the receive queue. The message should only
@@ -418,20 +516,52 @@ impl<W:Write> RawPeer<W> {
         self.0.rx_cvar.notify_one();
     }
 
+    fn try_get_idle(&self) -> Option<usize> {
+        self.0.idle_queue.lock().unwrap().pop_front()
+    }
+
+    /// Checks status of the most imminent timer. If that timer has expired,
+    /// returns `Some(Ok(_))`, with the corresponding token.
+    /// If a timer exists but has not expired, returns `Some(Err(_))`,
+    /// with the error value being the `Duration` until the timer is ready.
+    /// Returns `None` if no timers are registered.
+    fn check_timers(&self) -> Option<Result<usize, Duration>> {
+        let mut timers = self.0.timers.lock().unwrap();
+        match timers.peek() {
+            None => return None,
+            Some(t) => {
+                let now = Instant::now();
+                if t.fire_after > now {
+                    return Some(Err(t.fire_after - now));
+                }
+            }
+        }
+        Some(Ok(timers.pop().unwrap().token))
+    }
+
     /// send disconnect error to pending requests.
     fn disconnect(&self) {
         let mut pending = self.0.pending.lock().unwrap();
-        let ids = pending.keys().map(|id| *id).collect::<Vec<_>>();
-        for id in ids.iter() {
+        let ids = pending.keys().cloned().collect::<Vec<_>>();
+        for id in &ids {
             let callback = pending.remove(id).unwrap();
             callback.invoke(Err(Error::PeerDisconnect));
         }
+        self.0.needs_exit.store(true, Ordering::Relaxed);
+    }
+
+    /// Returns `true` if an error has occured in the main thread.
+    fn needs_exit(&self) -> bool {
+        self.0.needs_exit.load(Ordering::Relaxed)
+    }
+
+    fn reset_needs_exit(&self) {
+        self.0.needs_exit.store(false, Ordering::SeqCst);
     }
 }
 
-impl Clone for Box<Peer>
-{
-    fn clone(&self) -> Box<Peer> {
+impl Clone for Box<dyn Peer> {
+    fn clone(&self) -> Box<dyn Peer> {
         self.box_clone()
     }
 }
@@ -442,29 +572,18 @@ impl<W: Write> Clone for RawPeer<W> {
     }
 }
 
-// =============================================================================
-//  Helper functions for value manipulation
-// =============================================================================
-
-//TODO: delete after finishing migration
-pub fn dict_get_u64(dict: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
-    dict.get(key).and_then(Value::as_u64)
+//NOTE: for our timers to work with Rust's BinaryHeap we want to reverse
+//the default comparison; smaller `Instant`'s are considered 'greater'.
+impl Ord for Timer {
+    fn cmp(&self, other: &Timer) -> cmp::Ordering {
+        other.fire_after.cmp(&self.fire_after)
+    }
 }
 
-pub fn dict_get_string<'a>(dict: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
-    dict.get(key).and_then(Value::as_str)
-}
-
-pub fn dict_get_bool<'a>(dict: &'a serde_json::Map<String, Value>, key: &str) -> Option<bool> {
-    dict.get(key).and_then(Value::as_bool)
-}
-
-pub fn arr_get_u64(arr: &[Value], idx: usize) -> Option<u64> {
-    arr.get(idx).and_then(Value::as_u64)
-}
-
-pub fn arr_get_i64(arr: &[Value], idx: usize) -> Option<i64> {
-    arr.get(idx).and_then(Value::as_i64)
+impl PartialOrd for Timer {
+    fn partial_cmp(&self, other: &Timer) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[cfg(test)]
@@ -472,18 +591,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dict_get_u64() {
-        let dict = json!({"life_meaning": 42});
-        let dict = dict.as_object().unwrap();
-        assert_eq!(dict_get_u64(&dict, "life_meaning"), Some(42));
-        assert_eq!(dict_get_u64(&dict, "tea"), None);
-    }
-
-    #[test]
     fn test_parse_notif() {
         let reader = MessageReader::default();
-        let json = reader.parse(
-            r#"{"method": "hi", "params": {"words": "plz"}}"#).unwrap();
+        let json = reader.parse(r#"{"method": "hi", "params": {"words": "plz"}}"#).unwrap();
         assert!(!json.is_response());
         let rpc = json.into_rpc::<Value, Value>().unwrap();
         match rpc {
@@ -495,8 +605,8 @@ mod tests {
     #[test]
     fn test_parse_req() {
         let reader = MessageReader::default();
-        let json = reader.parse(
-            r#"{"id": 5, "method": "hi", "params": {"words": "plz"}}"#).unwrap();
+        let json =
+            reader.parse(r#"{"id": 5, "method": "hi", "params": {"words": "plz"}}"#).unwrap();
         assert!(!json.is_response());
         let rpc = json.into_rpc::<Value, Value>().unwrap();
         match rpc {
@@ -509,9 +619,8 @@ mod tests {
     fn test_parse_bad_json() {
         // missing "" around params
         let reader = MessageReader::default();
-        let json = reader.parse(
-            r#"{"id": 5, "method": "hi", params: {"words": "plz"}}"#)
-            .err().unwrap();
+        let json =
+            reader.parse(r#"{"id": 5, "method": "hi", params: {"words": "plz"}}"#).err().unwrap();
 
         match json {
             ReadError::Json(..) => (),

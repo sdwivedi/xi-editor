@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All rights reserved.
+// Copyright 2017 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,9 @@
 //!
 //! For discussion of this approach, see [this
 //! issue](https://github.com/google/xi-editor/issues/284).
-
 use std::collections::HashMap;
 
 use syntect::parsing::Scope;
-
 
 #[derive(Debug, Default)]
 struct Node {
@@ -56,18 +54,18 @@ impl Node {
         if stack.len() == 1 {
             if !self.children.contains_key(first) {
                 self.children.insert(first.to_owned(), Node::new(next_id));
-                return LookupResult::New(next_id)
+                return LookupResult::New(next_id);
             }
 
             // if key exists, value still might not be assigned:
-            let needs_value = self.children.get(first).unwrap().value.is_none();
+            let needs_value = self.children[first].value.is_none();
             if needs_value {
                 let node = self.children.get_mut(first).unwrap();
                 node.value = Some(next_id);
-                return LookupResult::New(next_id)
+                return LookupResult::New(next_id);
             } else {
-               let value = self.children.get(first).unwrap().value.unwrap();
-                return LookupResult::Existing(value)
+                let value = self.children[first].value.unwrap();
+                return LookupResult::Existing(value);
             }
         }
         // not the last item: recurse, creating node as necessary
@@ -87,8 +85,8 @@ impl StackMap {
             self.next_id += 1;
         }
         result
-        }
     }
+}
 
 impl LookupResult {
     pub fn is_new(&self) -> bool {
@@ -99,12 +97,11 @@ impl LookupResult {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntect::parsing::ScopeStack;
     use std::str::FromStr;
+    use syntect::parsing::ScopeStack;
 
     #[test]
     fn test_get_value() {

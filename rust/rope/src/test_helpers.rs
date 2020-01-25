@@ -1,4 +1,4 @@
-// Copyright 2016 Google Inc. All rights reserved.
+// Copyright 2016 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use multiset::{SubsetBuilder, Subset};
-use delta::{Delta, self};
-use rope::{Rope, RopeInfo};
-use interval::Interval;
+use crate::delta::{self, Delta};
+use crate::interval::Interval;
+use crate::multiset::{Subset, SubsetBuilder};
+use crate::rope::{Rope, RopeInfo};
 
 /// Creates a `Subset` of `s` by scanning through `substr` and finding which
 /// characters of `s` are missing from it in order. Returns a `Subset` which
@@ -51,11 +51,11 @@ pub fn parse_subset(s: &str) -> Subset {
 
     for c in s.chars() {
         if c == '#' {
-            sb.push_segment(1,1);
+            sb.push_segment(1, 1);
         } else if c == 'e' {
             // do nothing, used for empty subsets
         } else {
-            sb.push_segment(1,0);
+            sb.push_segment(1, 0);
         }
     }
 
@@ -81,11 +81,11 @@ pub fn parse_delta(s: &str) -> Delta<RopeInfo> {
         if c == '-' {
             i += 1;
         } else if c == '!' {
-            b.delete(Interval::new_closed_open(i,i+1));
+            b.delete(Interval::new(i, i + 1));
             i += 1;
         } else {
             let inserted = format!("{}", c);
-            b.replace(Interval::new_closed_open(i,i), Rope::from(inserted));
+            b.replace(Interval::new(i, i), Rope::from(inserted));
         }
     }
 

@@ -1,4 +1,4 @@
-// Copyright 2016 Google Inc. All rights reserved.
+// Copyright 2016 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,17 @@
 //!
 //! [Serde]: https://serde.rs
 
+use std::path::PathBuf;
 
-use serde_json::{self, Value};
 use serde::de::{self, Deserialize, Deserializer};
 use serde::ser::{self, Serialize, Serializer};
+use serde_json::{self, Value};
 
-use tabs::ViewIdentifier;
-use plugins::PlaceholderRpc;
-
+use crate::config::{ConfigDomainExternal, Table};
+use crate::plugins::PlaceholderRpc;
+use crate::syntax::LanguageId;
+use crate::tabs::ViewId;
+use crate::view::Size;
 
 // =============================================================================
 //  Command types
@@ -36,15 +39,12 @@ use plugins::PlaceholderRpc;
 #[doc(hidden)]
 pub struct EmptyStruct {}
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[serde(tag = "method", content = "params")]
 /// The notifications which make up the base of the protocol.
 ///
 /// # Note
 ///
 /// For serialization, all identifiers are converted to "snake_case".
-/// 
+///
 /// # Examples
 ///
 /// The `close_view` command:
@@ -52,8 +52,7 @@ pub struct EmptyStruct {}
 /// ```
 /// # extern crate xi_core_lib as xi_core;
 /// extern crate serde_json;
-/// # fn main() {
-/// use xi_core::rpc::CoreNotification;
+/// use crate::xi_core::rpc::CoreNotification;
 ///
 /// let json = r#"{
 ///     "method": "close_view",
@@ -65,7 +64,6 @@ pub struct EmptyStruct {}
 ///     CoreNotification::CloseView { .. } => (), // expected
 ///     other => panic!("Unexpected variant"),
 /// }
-/// # }
 /// ```
 ///
 /// The `client_started` command:
@@ -73,8 +71,7 @@ pub struct EmptyStruct {}
 /// ```
 /// # extern crate xi_core_lib as xi_core;
 /// extern crate serde_json;
-/// # fn main() {
-/// use xi_core::rpc::CoreNotification;
+/// use crate::xi_core::rpc::CoreNotification;
 ///
 /// let json = r#"{
 ///     "method": "client_started",
@@ -83,11 +80,13 @@ pub struct EmptyStruct {}
 ///
 /// let cmd: CoreNotification = serde_json::from_str(&json).unwrap();
 /// match cmd {
-///     CoreNotification::ClientStarted( .. )  => (), // expected
+///     CoreNotification::ClientStarted { .. }  => (), // expected
 ///     other => panic!("Unexpected variant"),
 /// }
-/// # }
 /// ```
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "method", content = "params")]
 pub enum CoreNotification {
     /// The 'edit' namespace, for view-specific editor actions.
     ///
@@ -112,10 +111,10 @@ pub enum CoreNotification {
     /// # extern crate xi_core_lib as xi_core;
     /// #[macro_use]
     /// extern crate serde_json;
-    /// use xi_core::rpc::*;
+    /// use crate::xi_core::rpc::*;
     /// # fn main() {
     /// let edit = EditCommand {
-    ///     view_id: "view-id-1".into(),
+    ///     view_id: 1.into(),
     ///     cmd: EditNotification::Insert { chars: "hello!".into() },
     /// };
     /// let rpc = CoreNotification::Edit(edit);
@@ -123,8 +122,8 @@ pub enum CoreNotification {
     ///     "method": "edit",
     ///     "params": {
     ///         "method": "insert",
+    ///         "view_id": "view-id-1",
     ///         "params": {
-    ///             "view_id": "view-id-1",
     ///             "chars": "hello!",
     ///         }
     ///     }
@@ -141,7 +140,7 @@ pub enum CoreNotification {
     /// (this should be changed to more accurately reflect the behaviour
     /// of the edit commands).
     ///
-    ///For the available commands, see [`PluginNotification`].
+    /// For the available commands, see [`PluginNotification`].
     ///
     /// [`PluginNotification`]: enum.PluginNotification.html
     ///
@@ -151,11 +150,11 @@ pub enum CoreNotification {
     /// # extern crate xi_core_lib as xi_core;
     /// #[macro_use]
     /// extern crate serde_json;
-    /// use xi_core::rpc::*;
+    /// use crate::xi_core::rpc::*;
     /// # fn main() {
     /// let rpc = CoreNotification::Plugin(
     ///     PluginNotification::Start {
-    ///         view_id: "view-id-1".into(),
+    ///         view_id: 1.into(),
     ///         plugin_name: "syntect".into(),
     ///     });
     ///
@@ -172,21 +171,41 @@ pub enum CoreNotification {
     /// ```
     Plugin(PluginNotification),
     /// Tells `xi-core` to close the specified view.
-    CloseView { view_id: ViewIdentifier },
+    CloseView { view_id: ViewId },
     /// Tells `xi-core` to save the contents of the specified view's
     /// buffer to the specified path.
-    Save { view_id: ViewIdentifier, file_path: String },
+    Save { view_id: ViewId, file_path: String },
     /// Tells `xi-core` to set the theme.
     SetTheme { theme_name: String },
     /// Notifies `xi-core` that the client has started.
-    //TODO: this should be a unit, but we have a minor issue with serde.
-    //see https://github.com/google/xi-editor/issues/400
-    ClientStarted(EmptyStruct),
+    ClientStarted {
+        #[serde(default)]
+        config_dir: Option<PathBuf>,
+        /// Path to additional plugins, included by the client.
+        #[serde(default)]
+        client_extras_dir: Option<PathBuf>,
+    },
+    /// Updates the user's config for the given domain. Where keys in
+    /// `changes` are `null`, those keys are cleared in the user config
+    /// for that domain; otherwise the config is updated with the new
+    /// value.
+    ///
+    /// Note: If the client is using file-based config, the only valid
+    /// domain argument is `ConfigDomain::UserOverride(_)`, which
+    /// represents non-persistent view-specific settings, such as when
+    /// a user manually changes whitespace settings for a given view.
+    ModifyUserConfig { domain: ConfigDomainExternal, changes: Table },
+    /// Control whether the tracing infrastructure is enabled.
+    /// This propagates to all peers that should respond by toggling its own
+    /// infrastructure on/off.
+    TracingConfig { enabled: bool },
+    /// Save trace data to the given path.  The core will first send
+    /// CoreRequest::CollectTrace to all peers to collect the samples.
+    SaveTrace { destination: PathBuf, frontend_samples: Value },
+    /// Tells `xi-core` to set the language id for the view.
+    SetLanguage { view_id: ViewId, language_id: LanguageId },
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[serde(tag = "method", content = "params")]
 /// The requests which make up the base of the protocol.
 ///
 /// All requests expect a response.
@@ -194,11 +213,11 @@ pub enum CoreNotification {
 /// # Examples
 ///
 /// The `new_view` command:
+///
 /// ```
 /// # extern crate xi_core_lib as xi_core;
 /// extern crate serde_json;
-/// # fn main() {
-/// use xi_core::rpc::CoreRequest;
+/// use crate::xi_core::rpc::CoreRequest;
 ///
 /// let json = r#"{
 ///     "method": "new_view",
@@ -210,21 +229,28 @@ pub enum CoreNotification {
 ///     CoreRequest::NewView { .. } => (), // expected
 ///     other => panic!("Unexpected variant {:?}", other),
 /// }
-/// # }
 /// ```
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "method", content = "params")]
 pub enum CoreRequest {
     /// The 'edit' namespace, for view-specific requests.
     Edit(EditCommand<EditRequest>),
     /// Tells `xi-core` to create a new view. If the `file_path`
-    /// argument is present, `xi-core` should attemp to open the file
+    /// argument is present, `xi-core` should attempt to open the file
     /// at that location.
     ///
     /// Returns the view identifier that should be used to interact
     /// with the newly created view.
     NewView { file_path: Option<String> },
+    /// Returns the current collated config object for the given view.
+    GetConfig { view_id: ViewId },
+    /// Returns the contents of the buffer for a given `ViewId`.
+    /// In the future this might also be used to return structured data (such
+    /// as for printing).
+    DebugGetContents { view_id: ViewId },
 }
 
-#[derive(Debug, Clone, PartialEq)]
 /// A helper type, which extracts the `view_id` field from edit
 /// requests and notifications.
 ///
@@ -238,8 +264,7 @@ pub enum CoreRequest {
 /// ```
 /// # extern crate xi_core_lib as xi_core;
 /// extern crate serde_json;
-/// # fn main() {
-/// use xi_core::rpc::*;
+/// use crate::xi_core::rpc::*;
 ///
 /// let json = r#"{
 ///     "view_id": "view-id-1",
@@ -252,18 +277,41 @@ pub enum CoreRequest {
 ///     EditNotification::Scroll( .. ) => (), // expected
 ///     other => panic!("Unexpected variant {:?}", other),
 /// }
-/// # }
 /// ```
+#[derive(Debug, Clone, PartialEq)]
 pub struct EditCommand<T> {
-    pub view_id: ViewIdentifier,
+    pub view_id: ViewId,
     pub cmd: T,
 }
 
+/// The smallest unit of text that a gesture can select
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Copy, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionGranularity {
+    /// Selects any point or character range
+    Point,
+    /// Selects one word at a time
+    Word,
+    /// Selects one line at a time
+    Line,
+}
+
 /// An enum representing touch and mouse gestures applied to the text.
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Copy, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum GestureType {
+    Select { granularity: SelectionGranularity, multi: bool },
+    SelectExtend { granularity: SelectionGranularity },
+    Drag,
+
+    // Deprecated
+    PointSelect,
     ToggleSel,
+    RangeSelect,
+    LineSelect,
+    WordSelect,
+    MultiLineSelect,
+    MultiWordSelect,
 }
 
 /// An inclusive range.
@@ -272,8 +320,8 @@ pub enum GestureType {
 ///
 /// Several core protocol commands use a params array to pass arguments
 /// which are named, internally. this type use custom Serialize /
-/// Deserialize impls to accomodate this.
-#[derive(PartialEq, Eq, Debug)]
+/// Deserialize impls to accommodate this.
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct LineRange {
     pub first: i64,
     pub last: i64,
@@ -282,7 +330,7 @@ pub struct LineRange {
 /// A mouse event. See the note for [`LineRange`].
 ///
 /// [`LineRange`]: enum.LineRange.html
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct MouseAction {
     pub line: u64,
     pub column: u64,
@@ -290,15 +338,55 @@ pub struct MouseAction {
     pub click_count: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+pub struct Position {
+    pub line: usize,
+    pub column: usize,
+}
+
+/// Represents how the current selection is modified (used by find
+/// operations).
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
-#[serde(tag = "method", content = "params")]
+pub enum SelectionModifier {
+    None,
+    Set,
+    Add,
+    AddRemovingCurrent,
+}
+
+impl Default for SelectionModifier {
+    fn default() -> SelectionModifier {
+        SelectionModifier::Set
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub struct FindQuery {
+    pub id: Option<usize>,
+    pub chars: String,
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub whole_words: bool,
+}
+
 /// The edit-related notifications.
 ///
 /// Alongside the [`EditRequest`] members, these commands constitute
 /// the API for interacting with a particular window and document.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "method", content = "params")]
 pub enum EditNotification {
-    Insert { chars: String },
+    Insert {
+        chars: String,
+    },
+    Paste {
+        chars: String,
+    },
     DeleteForward,
     DeleteBackward,
     DeleteWordForward,
@@ -324,7 +412,9 @@ pub enum EditNotification {
     MoveWordRight,
     MoveWordRightAndModifySelection,
     MoveToBeginningOfParagraph,
+    MoveToBeginningOfParagraphAndModifySelection,
     MoveToEndOfParagraph,
+    MoveToEndOfParagraphAndModifySelection,
     MoveToLeftEndOfLine,
     MoveToLeftEndOfLineAndModifySelection,
     MoveToRightEndOfLine,
@@ -341,26 +431,101 @@ pub enum EditNotification {
     AddSelectionAbove,
     AddSelectionBelow,
     Scroll(LineRange),
-    GotoLine { line: u64 },
+    Resize(Size),
+    GotoLine {
+        line: u64,
+    },
     RequestLines(LineRange),
     Yank,
     Transpose,
     Click(MouseAction),
     Drag(MouseAction),
-    Gesture { line: u64, col: u64, ty: GestureType},
+    Gesture {
+        line: u64,
+        col: u64,
+        ty: GestureType,
+    },
     Undo,
     Redo,
-    FindNext { wrap_around: Option<bool>, allow_same: Option<bool> },
-    FindPrevious { wrap_around: Option<bool> },
+    Find {
+        chars: String,
+        case_sensitive: bool,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        whole_words: bool,
+    },
+    MultiFind {
+        queries: Vec<FindQuery>,
+    },
+    FindNext {
+        #[serde(default)]
+        wrap_around: bool,
+        #[serde(default)]
+        allow_same: bool,
+        #[serde(default)]
+        modify_selection: SelectionModifier,
+    },
+    FindPrevious {
+        #[serde(default)]
+        wrap_around: bool,
+        #[serde(default)]
+        allow_same: bool,
+        #[serde(default)]
+        modify_selection: SelectionModifier,
+    },
+    FindAll,
     DebugRewrap,
+    DebugWrapWidth,
     /// Prints the style spans present in the active selection.
     DebugPrintSpans,
+    DebugToggleComment,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+    Reindent,
+    Indent,
+    Outdent,
+    /// Indicates whether find highlights should be rendered
+    HighlightFind {
+        visible: bool,
+    },
+    SelectionForFind {
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    Replace {
+        chars: String,
+        #[serde(default)]
+        preserve_case: bool,
+    },
+    ReplaceNext,
+    ReplaceAll,
+    SelectionForReplace,
+    RequestHover {
+        request_id: usize,
+        position: Option<Position>,
+    },
+    SelectionIntoLines,
+    DuplicateLine,
+    IncreaseNumber,
+    DecreaseNumber,
+    ToggleRecording {
+        recording_name: Option<String>,
+    },
+    PlayRecording {
+        recording_name: String,
+    },
+    ClearRecording {
+        recording_name: String,
+    },
+    CollapseSelections,
 }
 
+/// The edit related requests.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
-/// The edit related requests.
 pub enum EditRequest {
     /// Cuts the active selection, returning their contents,
     /// or `Null` if the selection was empty.
@@ -368,56 +533,54 @@ pub enum EditRequest {
     /// Copies the active selection, returning their contents or
     /// or `Null` if the selection was empty.
     Copy,
-    /// Searches the document for `chars`, if present, falling back on
-    /// the last selection region if `chars` is `None`.
-    ///
-    /// If `chars` is `None` and there is an active selection, returns
-    /// the string value used for the search, else returns `Null`.
-    Find { chars: Option<String>, case_sensitive: bool },
 }
 
-
+/// The plugin related notifications.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "command")]
 #[serde(rename_all = "snake_case")]
-/// The plugin related notifications.
 pub enum PluginNotification {
-    Start { view_id: ViewIdentifier, plugin_name: String },
-    Stop { view_id: ViewIdentifier, plugin_name: String },
-    PluginRpc { view_id: ViewIdentifier, receiver: String, rpc: PlaceholderRpc },
+    Start { view_id: ViewId, plugin_name: String },
+    Stop { view_id: ViewId, plugin_name: String },
+    PluginRpc { view_id: ViewId, receiver: String, rpc: PlaceholderRpc },
 }
 
 // Serialize / Deserialize
 
-impl<T: Serialize> Serialize for EditCommand<T>
-{
+impl<T: Serialize> Serialize for EditCommand<T> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: Serializer
+    where
+        S: Serializer,
     {
         let mut v = serde_json::to_value(&self.cmd).map_err(ser::Error::custom)?;
-        v["params"]["view_id"] = json!(self.view_id);
+        v["view_id"] = json!(self.view_id);
         v.serialize(serializer)
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for EditCommand<T>
-{
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for EditCommand<T> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
         struct InnerId {
-            view_id: ViewIdentifier,
+            view_id: ViewId,
         }
 
         let mut v = Value::deserialize(deserializer)?;
         let helper = InnerId::deserialize(&v).map_err(de::Error::custom)?;
         let InnerId { view_id } = helper;
+
         // if params are empty, remove them
         let remove_params = match v.get("params") {
-            Some(&Value::Object(ref obj)) => obj.is_empty(),
-            Some(&Value::Array(ref arr)) => arr.is_empty(),
-            Some(_) => return Err(de::Error::custom("'params' field, if present, must be object or array.")),
+            Some(&Value::Object(ref obj)) => obj.is_empty() && T::deserialize(v.clone()).is_err(),
+            Some(&Value::Array(ref arr)) => arr.is_empty() && T::deserialize(v.clone()).is_err(),
+            Some(_) => {
+                return Err(de::Error::custom(
+                    "'params' field, if present, must be object or array.",
+                ));
+            }
             None => false,
         };
 
@@ -430,51 +593,71 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for EditCommand<T>
     }
 }
 
-impl Serialize for MouseAction
-{
+impl Serialize for MouseAction {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: Serializer
+    where
+        S: Serializer,
     {
         #[derive(Serialize)]
         struct Helper(u64, u64, u64, Option<u64>);
 
         let as_tup = Helper(self.line, self.column, self.flags, self.click_count);
-        let v = serde_json::to_value(&as_tup).map_err(ser::Error::custom)?;
-        v.serialize(serializer)
+        as_tup.serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for MouseAction
-{
+impl<'de> Deserialize<'de> for MouseAction {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         let v: Vec<u64> = Vec::deserialize(deserializer)?;
         let click_count = if v.len() == 4 { Some(v[3]) } else { None };
-        Ok(MouseAction { line: v[0], column: v[1], flags: v[2], click_count: click_count })
+        Ok(MouseAction { line: v[0], column: v[1], flags: v[2], click_count })
     }
 }
 
-impl Serialize for LineRange
-{
+impl Serialize for LineRange {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where S: Serializer
+    where
+        S: Serializer,
     {
         let as_tup = (self.first, self.last);
-        let v = serde_json::to_value(&as_tup).map_err(ser::Error::custom)?;
-        v.serialize(serializer)
+        as_tup.serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for LineRange
-{
+impl<'de> Deserialize<'de> for LineRange {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where D: Deserializer<'de>
+    where
+        D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
         struct TwoTuple(i64, i64);
 
         let tup = TwoTuple::deserialize(deserializer)?;
         Ok(LineRange { first: tup.0, last: tup.1 })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabs::ViewId;
+
+    #[test]
+    fn test_serialize_edit_command() {
+        // Ensure that an EditCommand can be serialized and then correctly deserialized.
+        let message: String = "hello world".into();
+        let edit = EditCommand {
+            view_id: ViewId(1),
+            cmd: EditNotification::Insert { chars: message.clone() },
+        };
+        let json = serde_json::to_string(&edit).unwrap();
+        let cmd: EditCommand<EditNotification> = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd.view_id, edit.view_id);
+        if let EditNotification::Insert { chars } = cmd.cmd {
+            assert_eq!(chars, message);
+        }
     }
 }

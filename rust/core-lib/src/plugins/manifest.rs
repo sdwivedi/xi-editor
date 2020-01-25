@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All rights reserved.
+// Copyright 2017 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,91 +16,60 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{self, Value};
-use serde::Serialize;
 
-use syntax::SyntaxDefinition;
-
-// optional environment variable for debug plugin executables
-#[cfg(not(target_os = "fuchsia"))]
-static PLUGIN_DIR: &'static str = "XI_PLUGIN_DIR";
-
-// example plugins. Eventually these should be loaded from disk.
-#[cfg(not(target_os = "fuchsia"))]
-pub fn debug_plugins() -> Vec<PluginDescription> {
-    use std::env;
-    use self::PluginActivation::*;
-    use self::PluginScope::*;
-    let plugin_dir = match env::var(PLUGIN_DIR).map(PathBuf::from) {
-        Ok(p) => p,
-        Err(_) => env::current_exe().unwrap().parent().unwrap().to_owned(),
-    };
-    print_err!("looking for debug plugins in {:?}", plugin_dir);
-
-    let make_path = |p: &str| -> PathBuf {
-        let mut pb = plugin_dir.clone();
-        pb.push(p);
-        pb
-    };
-
-    vec![
-        PluginDescription::new("syntect", "0.0", BufferLocal, make_path("xi-syntect-plugin"),
-        vec![Autorun], Vec::new()),
-        PluginDescription::new("braces", "0.0", BufferLocal, make_path("bracket_example.py"),
-        Vec::new(), Vec::new()),
-        PluginDescription::new("spellcheck", "0.0", BufferLocal, make_path("spellcheck.py"),
-        Vec::new(), Vec::new()),
-        PluginDescription::new("shouty", "0.0", BufferLocal, make_path("shouty.py"),
-        Vec::new(), Vec::new()),
-    ].iter()
-        .filter(|desc|{
-            if !desc.exec_path.exists() {
-                print_err!("missing plugin {} at {:?}", desc.name, desc.exec_path);
-                false
-            } else {
-                true
-            }
-        })
-        .map(|desc| desc.to_owned())
-        .collect::<Vec<_>>()
-}
-
-#[cfg(target_os = "fuchsia")]
-pub fn debug_plugins() -> Vec<PluginDescription> {
-    Vec::new()
-}
+use crate::syntax::{LanguageDefinition, LanguageId};
 
 /// Describes attributes and capabilities of a plugin.
 ///
 /// Note: - these will eventually be loaded from manifest files.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct PluginDescription {
     pub name: String,
     pub version: String,
+    #[serde(default)]
     pub scope: PluginScope,
     // more metadata ...
     /// path to plugin executable
+    #[serde(deserialize_with = "platform_exec_path")]
     pub exec_path: PathBuf,
     /// Events that cause this plugin to run
+    #[serde(default)]
     pub activations: Vec<PluginActivation>,
+    #[serde(default)]
     pub commands: Vec<Command>,
+    #[serde(default)]
+    pub languages: Vec<LanguageDefinition>,
+}
+
+fn platform_exec_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+    let exec_path = PathBuf::deserialize(deserializer)?;
+    if cfg!(windows) {
+        Ok(exec_path.with_extension("exe"))
+    } else {
+        Ok(exec_path)
+    }
 }
 
 /// `PluginActivation`s represent events that trigger running a plugin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PluginActivation {
     /// Always run this plugin, when available.
     Autorun,
     /// Run this plugin if the provided SyntaxDefinition is active.
     #[allow(dead_code)]
-    OnSyntax(SyntaxDefinition),
+    OnSyntax(LanguageId),
     /// Run this plugin in response to a given command.
     #[allow(dead_code)]
     OnCommand,
 }
 
-#[derive(Debug, Clone)]
 /// Describes the scope of events a plugin receives.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PluginScope {
     /// The plugin receives events from multiple buffers.
     Global,
@@ -124,7 +93,6 @@ pub struct Command {
     pub args: Vec<CommandArgument>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// A user provided argument to a plugin command.
 pub struct CommandArgument {
@@ -142,7 +110,12 @@ pub struct CommandArgument {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ArgumentType {
-    Number, Int, PosInt, Bool, String, Choice
+    Number,
+    Int,
+    PosInt,
+    Bool,
+    String,
+    Choice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -167,29 +140,37 @@ pub struct PlaceholderRpc {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcType {
-    Notification, Request
+    Notification,
+    Request,
 }
 
 impl Command {
-    pub fn new<S, V>(title: S, description: S,
-                     rpc_cmd: PlaceholderRpc, args: V) -> Self
-    where S: AsRef<str>,
-          V: Into<Option<Vec<CommandArgument>>> {
+    pub fn new<S, V>(title: S, description: S, rpc_cmd: PlaceholderRpc, args: V) -> Self
+    where
+        S: AsRef<str>,
+        V: Into<Option<Vec<CommandArgument>>>,
+    {
         let title = title.as_ref().to_owned();
         let description = description.as_ref().to_owned();
-        let args = args.into().unwrap_or(Vec::new());
+        let args = args.into().unwrap_or_else(Vec::new);
         Command { title, description, rpc_cmd, args }
     }
 }
 
 impl CommandArgument {
-    pub fn new<S: AsRef<str>>(title: S, description: S, key: S,
-                              arg_type: ArgumentType,
-                              options: Option<Vec<ArgumentOption>>) -> Self {
+    pub fn new<S: AsRef<str>>(
+        title: S,
+        description: S,
+        key: S,
+        arg_type: ArgumentType,
+        options: Option<Vec<ArgumentOption>>,
+    ) -> Self {
         let key = key.as_ref().to_owned();
         let title = title.as_ref().to_owned();
         let description = description.as_ref().to_owned();
-        if arg_type == ArgumentType::Choice { assert!(options.is_some()) }
+        if arg_type == ArgumentType::Choice {
+            assert!(options.is_some())
+        }
         CommandArgument { title, description, key, arg_type, options }
     }
 }
@@ -204,8 +185,9 @@ impl ArgumentOption {
 
 impl PlaceholderRpc {
     pub fn new<S, V>(method: S, params: V, request: bool) -> Self
-        where S: AsRef<str>,
-              V: Into<Option<Value>>
+    where
+        S: AsRef<str>,
+        V: Into<Option<Value>>,
     {
         let method = method.as_ref().to_owned();
         let params = params.into().unwrap_or(json!({}));
@@ -229,27 +211,12 @@ impl PlaceholderRpc {
     }
 
     /// Returns a reference to the placeholder's method.
-    pub fn method_ref<'a>(&'a self) -> &'a str {
+    pub fn method_ref(&self) -> &str {
         &self.method
     }
 }
 
 impl PluginDescription {
-    #[cfg(not(target_os = "fuchsia"))]
-    fn new<S, P>(name: S, version: S, scope: PluginScope, exec_path: P,
-                 activations: Vec<PluginActivation>, commands: Vec<Command>) -> Self
-        where S: Into<String>, P: Into<PathBuf>
-    {
-        PluginDescription {
-            name: name.into(),
-            scope: scope,
-            version: version.into(),
-            exec_path: exec_path.into(),
-            activations: activations,
-            commands: commands,
-        }
-    }
-
     /// Returns `true` if this plugin is globally scoped, else `false`.
     pub fn is_global(&self) -> bool {
         match self.scope {
@@ -259,11 +226,38 @@ impl PluginDescription {
     }
 }
 
+impl Default for PluginScope {
+    fn default() -> Self {
+        PluginScope::BufferLocal
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json;
+
+    #[test]
+    fn platform_exec_path() {
+        let json = r#"
+        {
+            "name": "test_plugin",
+            "version": "0.0.0",
+            "scope": "global",
+            "exec_path": "path/to/binary",
+            "activations": [],
+            "commands": [],
+            "languages": []
+        }
+        "#;
+
+        let plugin_desc: PluginDescription = serde_json::from_str(&json).unwrap();
+        if cfg!(windows) {
+            assert!(plugin_desc.exec_path.ends_with("binary.exe"));
+        } else {
+            assert!(plugin_desc.exec_path.ends_with("binary"));
+        }
+    }
 
     #[test]
     fn test_serde_command() {

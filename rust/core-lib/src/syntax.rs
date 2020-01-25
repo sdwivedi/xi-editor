@@ -1,4 +1,4 @@
-// Copyright 2017 Google Inc. All rights reserved.
+// Copyright 2017 The xi-editor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,109 +14,155 @@
 
 //! Very basic syntax detection.
 
-use std::fmt;
+use std::borrow::Borrow;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum SyntaxDefinition {
-    Plaintext, Markdown, Python, Rust, C, Go, Dart, Swift, Toml,
-    Json, Yaml, Cpp, Objc, Shell, Ruby, Javascript, Java, Php,
-    Perl,
+use crate::config::Table;
+
+/// The canonical identifier for a particular `LanguageDefinition`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LanguageId(Arc<String>);
+
+/// Describes a `LanguageDefinition`. Although these are provided by plugins,
+/// they are a fundamental concept in core, used to determine things like
+/// plugin activations and active user config tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageDefinition {
+    pub name: LanguageId,
+    pub extensions: Vec<String>,
+    pub first_line_match: Option<String>,
+    pub scope: String,
+    #[serde(skip)]
+    pub default_config: Option<Table>,
 }
 
-impl Default for SyntaxDefinition {
-    fn default() -> Self {
-        SyntaxDefinition::Plaintext
-    }
+/// A repository of all loaded `LanguageDefinition`s.
+#[derive(Debug, Default)]
+pub struct Languages {
+    // NOTE: BTreeMap is used for sorting the languages by name alphabetically
+    named: BTreeMap<LanguageId, Arc<LanguageDefinition>>,
+    extensions: HashMap<String, Arc<LanguageDefinition>>,
 }
 
-// TODO: these should also serialize as strings, probably using this as a guide:
-
-impl SyntaxDefinition {
-    pub fn new<'a, S: Into<Option<&'a str>>>(s: S) -> Self {
-        use self::SyntaxDefinition::*;
-        if let Some(s) = s.into() {
-            match &*s.split('.').rev().nth(0).unwrap_or("").to_lowercase() {
-                "rs" => Rust,
-                "md" | "mdown" => Markdown,
-                "py" => Python,
-                "c" | "h" => C,
-                "go" => Go,
-                "dart" => Dart,
-                "swift" => Swift,
-                "toml" => Toml,
-                "json" => Json,
-                "yaml" => Yaml,
-                "cc" => Cpp,
-                "m" => Objc,
-                "sh" | "zsh" => Shell,
-                "rb" => Ruby,
-                "js" => Javascript,
-                "java" | "jav" => Java,
-                "php" => Php,
-                "pl" => Perl,
-                _ => Plaintext,
+impl Languages {
+    pub fn new(language_defs: &[LanguageDefinition]) -> Self {
+        let mut named = BTreeMap::new();
+        let mut extensions = HashMap::new();
+        for lang in language_defs.iter() {
+            let lang_arc = Arc::new(lang.clone());
+            named.insert(lang.name.clone(), lang_arc.clone());
+            for ext in &lang.extensions {
+                extensions.insert(ext.clone(), lang_arc.clone());
             }
-        } else {
-            Plaintext
+        }
+        Languages { named, extensions }
+    }
+
+    pub fn language_for_path(&self, path: &Path) -> Option<Arc<LanguageDefinition>> {
+        path.extension()
+            .or_else(|| path.file_name())
+            .and_then(|ext| self.extensions.get(ext.to_str().unwrap_or_default()))
+            .map(Arc::clone)
+    }
+
+    pub fn language_for_name<S>(&self, name: S) -> Option<Arc<LanguageDefinition>>
+    where
+        S: AsRef<str>,
+    {
+        self.named.get(name.as_ref()).map(Arc::clone)
+    }
+
+    /// Returns a Vec of any `LanguageDefinition`s which exist
+    /// in `self` but not `other`.
+    pub fn difference(&self, other: &Languages) -> Vec<Arc<LanguageDefinition>> {
+        self.named
+            .iter()
+            .filter(|(k, _)| !other.named.contains_key(*k))
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<LanguageDefinition>> {
+        self.named.values()
+    }
+}
+
+impl AsRef<str> for LanguageId {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+// let's us use &str to query a HashMap with `LanguageId` keys
+impl Borrow<str> for LanguageId {
+    fn borrow(&self) -> &str {
+        &self.0.as_ref()
+    }
+}
+
+impl<'a> From<&'a str> for LanguageId {
+    fn from(src: &'a str) -> LanguageId {
+        LanguageId(Arc::new(src.into()))
+    }
+}
+
+// for testing
+#[cfg(test)]
+impl LanguageDefinition {
+    pub(crate) fn simple(name: &str, exts: &[&str], scope: &str, config: Option<Table>) -> Self {
+        LanguageDefinition {
+            name: name.into(),
+            extensions: exts.iter().map(|s| (*s).into()).collect(),
+            first_line_match: None,
+            scope: scope.into(),
+            default_config: config,
         }
     }
-
-    //TODO: this is not currently used.
-    //We might want it for language server interop?
-    /// Canonical language identifiers, used for serialization.
-    /// https://code.visualstudio.com/docs/languages/identifiers
-    pub fn identifier(&self) -> &str {
-        use self::SyntaxDefinition::*;
-        match *self {
-            Rust => "rust",
-            Markdown => "markdown",
-            //TODO: :|
-            Python => "python3",
-            C => "c" ,
-            Go => "go",
-            Dart => "dart",
-            Swift => "swift",
-            Toml => "toml",
-            Json => "json",
-            Yaml => "yaml",
-            Cpp => "cpp",
-            Objc => "objective-c",
-            Shell => "shellscript",
-            Ruby => "ruby",
-            Javascript => "javascript",
-            Java => "java",
-            Php => "php",
-            Perl => "perl",
-            Plaintext => "plaintext",
-        }
-    }
 }
-
-impl<S: AsRef<str>> From<S> for SyntaxDefinition {
-    fn from(s: S) -> Self {
-        SyntaxDefinition::new(s.as_ref())
-    }
-}
-
-impl fmt::Display for SyntaxDefinition {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.identifier())
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_syntax() {
-        assert_eq!(SyntaxDefinition::from("plugins.rs"), SyntaxDefinition::Rust);
-        assert_eq!(SyntaxDefinition::from("plugins.py"), SyntaxDefinition::Python);
-        assert_eq!(SyntaxDefinition::from("header.h"), SyntaxDefinition::C);
-        assert_eq!(SyntaxDefinition::from("main.ada"), SyntaxDefinition::Plaintext);
-        assert_eq!(SyntaxDefinition::from("build"), SyntaxDefinition::Plaintext);
-        assert_eq!(SyntaxDefinition::from("build.test.sh"), SyntaxDefinition::Shell);
+    pub fn language_for_path() {
+        let ld_rust = LanguageDefinition {
+            name: LanguageId::from("Rust"),
+            extensions: vec![String::from("rs")],
+            scope: String::from("source.rust"),
+            first_line_match: None,
+            default_config: None,
+        };
+        let ld_commit_msg = LanguageDefinition {
+            name: LanguageId::from("Git Commit"),
+            extensions: vec![
+                String::from("COMMIT_EDITMSG"),
+                String::from("MERGE_MSG"),
+                String::from("TAG_EDITMSG"),
+            ],
+            scope: String::from("text.git.commit"),
+            first_line_match: None,
+            default_config: None,
+        };
+        let languages = Languages::new(&[ld_rust.clone(), ld_commit_msg.clone()]);
+
+        assert_eq!(
+            ld_rust.name,
+            languages.language_for_path(Path::new("/path/test.rs")).unwrap().name
+        );
+        assert_eq!(
+            ld_commit_msg.name,
+            languages.language_for_path(Path::new("/path/COMMIT_EDITMSG")).unwrap().name
+        );
+        assert_eq!(
+            ld_commit_msg.name,
+            languages.language_for_path(Path::new("/path/MERGE_MSG")).unwrap().name
+        );
+        assert_eq!(
+            ld_commit_msg.name,
+            languages.language_for_path(Path::new("/path/TAG_EDITMSG")).unwrap().name
+        );
     }
 }
